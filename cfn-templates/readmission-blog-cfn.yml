@@ -1,0 +1,442 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template to create AWS resources for readmission prediction solution
+
+Parameters: 
+  bucketprefix: 
+    Type: String
+    Default: 'readmission-data-ehr'
+    Description: S3 Bucket prefix
+  CFNDatabaseName:
+    Type: String
+    Default: 'ehr-db-readmission'
+    Description: AWS Glue crawler database name for raw data
+  CFNCrawlerName:
+    Type: String
+    Default: 'ehr-crawler-readmission'
+    Description: Name for AWS Glue crawler that crawls raw data
+  CFNDatabaseNameParquet:
+    Type: String
+    Default: 'ehr-dw-readmission'
+    Description: AWS Glue crawler database name for parquet data
+  CFNDWCrawlerName:
+    Type: String
+    Default: 'ehr-dw-crawler-readmission'
+    Description: Name for AWS Glue crawler that crawls parquet data
+  GlueManagedPolicy:
+    Type: String  
+    Default: 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+    Description: Name of AWS Managed Policy. Please do not change this value unless mentioned in the instructions
+  SageMakerManagedPolicy:
+    Type: String
+    Default: 'arn:aws:iam::aws:policy/AmazonSageMakerFullAccess'
+    Description: Name of AWS Managed Policy. Please do not change this value unless mentioned in the instructions
+  CFNJobName:
+    Type: String
+    Default: glue-etl-convert-to-parquet
+    Description: Name of AWS Glue job that converts raw data into parquet format
+  CFNJobTrainDataName:
+    Type: String
+    Default: glue-etl-produce-traing-data
+    Description: Name of AWS Glue job that produces training data for machine learning model
+  SGInstanceType:
+    Type: String
+    Default: ml.t2.medium
+    Description: Amazon SageMaker InstanceType for creating Jupyter Notebook Instance
+  SGNotebookName: 
+    Type: String
+    Default: readmission-sg-notebook
+    Description: Amazon SageMaker Notebook Instance Name
+  SGDefaultRepo:
+    Type: String
+    Default: 'https://github.com/anujag24/hospital-readmission-risk-prediction'
+    Description: Link to GitHub repository which contains the sample code
+  S3User: 
+    Type: String
+    Default: s3upload
+    Description: IAM User Name that will have access to upload objects to S3 Bucket
+
+Resources:
+  MyBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        !Join
+          - '-'
+          - - !Ref bucketprefix
+            - !Ref 'AWS::AccountId'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    DeletionPolicy: Delete
+
+  BucketPolicy: 
+    Type: AWS::S3::BucketPolicy
+    Properties: 
+      Bucket: !Ref MyBucket
+      PolicyDocument: 
+        Version: '2012-10-17'
+        Id: PutObjPolicy
+        Statement: ## Enforce all uploaded objects are encrypted on server side using KMS Key 
+        - Principal: "*"
+          Effect: Deny
+          Action: s3:PutObject
+          Resource: !Sub '${MyBucket.Arn}/*'
+          Condition:
+            StringNotEquals:
+              's3:x-amz-server-side-encryption': 'aws:kms'
+  MyUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Ref S3User
+      Path: "/"
+      Policies:
+      - PolicyName: giveaccess-to-s3-uploadobject
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - "s3:PutObject"
+            Resource: !Sub '${MyBucket.Arn}/*'
+
+  CMSymmetricKey:
+    Type: AWS::KMS::Key
+    Properties: 
+      Description: 'Customer managed key to encrypt and decrypt data'
+      Enabled: Yes
+      EnableKeyRotation: Yes
+      KeyUsage: ENCRYPT_DECRYPT
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: encryption-key
+        Statement:
+          - Sid: Enable Root User Permissions ## Root user in this account will have all permissions for this KMS key
+            Effect: Allow
+            Principal:
+              AWS: !Join 
+                - ''
+                - - 'arn:aws:iam::'
+                  - !Ref 'AWS::AccountId'
+                  - ':root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Enable IAM User Permissions ## Permissions for S3 Upload IAM User to access KMS key for uploading objects
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt MyUser.Arn
+            Action: 
+              - "kms:Decrypt"
+              - "kms:Encrypt"
+              - "kms:GenerateDataKey"
+              - "kms:GenerateDataKeyWithoutPlaintext"
+              - "kms:DescribeKey"
+            Resource: '*'
+  KeyAlias:
+    Type: 'AWS::KMS::Alias'
+    Properties:
+      AliasName: 
+        !Join
+          - '-'
+          - - 'alias/'
+            - !Ref bucketprefix
+            - !Ref 'AWS::AccountId'
+            - 'key'
+      TargetKeyId: !Ref CMSymmetricKey
+  #Create IAM Role assumed by the crawler. For demonstration, this role is given all permissions.
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "glue.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - !Ref GlueManagedPolicy
+      Policies:
+        -
+          PolicyName: "s3-access-glue"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: 
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:GetBucketAcl"
+                  - "s3:DeleteObject"
+                  - "s3:GetBucketLocation"
+                Resource: !Sub ${MyBucket.Arn}/*
+        -
+          PolicyName: "kms-key-access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: 
+                  - "kms:Decrypt"
+                  - "kms:Encrypt"
+                  - "kms:GenerateDataKey"
+                  - "kms:GenerateDataKeyWithoutPlaintext"
+                  - "kms:DescribeKey"
+                Resource: !Sub ${CMSymmetricKey.Arn}
+ # Create a database to contain tables created by the crawler
+  CFNDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref CFNDatabaseName
+        Description: "AWS Glue container to hold metadata tables for the crawler"
+  # Create a database to contain tables created by the crawler
+  CFNDatabaseParquet:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref CFNDatabaseNameParquet
+        Description: "AWS Glue container to hold metadata tables for the crawler"
+  GlueSecurityConfig:
+    Type: AWS::Glue::SecurityConfiguration
+    Properties: 
+      EncryptionConfiguration: 
+        S3Encryptions: 
+          - 
+            KmsKeyArn: !GetAtt CMSymmetricKey.Arn
+            S3EncryptionMode: SSE-KMS
+      Name: !Ref CFNCrawlerName
+ #Create a crawler to crawl the data on a public S3 bucket
+  CFNCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Ref CFNCrawlerName
+      Role: !GetAtt GlueServiceRole.Arn
+      #Classifiers: none, use the default classifier
+      Description: AWS Glue crawler to crawl flights data
+      #Schedule: none, use default run-on-demand
+      CrawlerSecurityConfiguration: !Ref CFNCrawlerName
+      DatabaseName: !Ref CFNDatabaseName
+      Targets:
+        S3Targets:
+          # Public S3 bucket with raw data
+          - Path:
+              !Join
+                - '/'
+                - - !Join 
+                      - '-'
+                      - - !Ref bucketprefix
+                        - !Ref 'AWS::AccountId'
+                  - 'raw-data'
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Configuration: "{\"Version\":1.0,\"CrawlerOutput\":{\"Partitions\":{\"AddOrUpdateBehavior\":\"InheritFromTable\"},\"Tables\":{\"AddOrUpdateBehavior\":\"MergeNewColumns\"}}}"
+  #Create a crawler to crawl the data on a public S3 bucket
+  CFNDWCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Ref CFNDWCrawlerName
+      Role: !GetAtt GlueServiceRole.Arn
+      #Classifiers: none, use the default classifier
+      Description: AWS Glue crawler to crawl flights data
+      #Schedule: none, use default run-on-demand
+      CrawlerSecurityConfiguration: !Ref CFNCrawlerName
+      DatabaseName: !Ref CFNDatabaseNameParquet
+      Targets:
+        S3Targets:
+          # Public S3 bucket with the flights data
+          - Path:
+              !Join
+                - '/'
+                - - !Join
+                      - '-'
+                      - - !Ref bucketprefix
+                        - !Ref 'AWS::AccountId'
+                  - 'output-dir'
+      ##TablePrefix: !Ref CFNTablePrefixName
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Configuration: "{\"Version\":1.0,\"CrawlerOutput\":{\"Partitions\":{\"AddOrUpdateBehavior\":\"InheritFromTable\"},\"Tables\":{\"AddOrUpdateBehavior\":\"MergeNewColumns\"}}}"  
+
+# Create job to run script which accesses scsv table and write to S3 file as parquet.
+# The script already exists and is called by this job	
+  CFNGlueJob:
+    Type: AWS::Glue::Job   
+    Properties:
+      Role: !Ref GlueServiceRole  
+      #DefaultArguments: JSON object 
+      # If script written in Scala, then set DefaultArguments={'--job-language'; 'scala', '--class': 'your scala class'}
+      #Connections:  No connection needed for S3 to S3 job 
+      #  ConnectionsList  
+      #MaxRetries: Double  
+      Description: Job created with CloudFormation  
+      GlueVersion: 1.0
+      #LogUri: String  
+      SecurityConfiguration: !Ref CFNCrawlerName
+      Command:   
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${bucketprefix}-${AWS::AccountId}/scripts/convert_to_parquet"
+             # for access to directories use proper IAM role with permission to buckets and folders that begin with "aws-glue-"					 
+             # script uses temp directory from job definition if required (temp directory not used S3 to S3)
+             # script defines target for output as s3://aws-glue-target/sal    			 
+      AllocatedCapacity: 5  
+      ExecutionProperty:   
+        MaxConcurrentRuns: 1  
+      Name: !Ref CFNJobName
+# Create job to run script which accesses scsv table and write to S3 file as parquet.
+# The script already exists and is called by this job	
+  CFNTrainDataGlueJob:
+    Type: AWS::Glue::Job   
+    Properties:
+      Role: !Ref GlueServiceRole  
+      #DefaultArguments: JSON object 
+      # If script written in Scala, then set DefaultArguments={'--job-language'; 'scala', '--class': 'your scala class'}
+      #Connections:  No connection needed for S3 to S3 job 
+      #  ConnectionsList  
+      #MaxRetries: Double  
+      Description: Job created with CloudFormation  
+      GlueVersion: 0.9 ## Spark ML container in Sagemaker supports MLeap based on Spark 2.2 so we need to build Spark ML model in Spark 2.2
+      #LogUri: String  
+      SecurityConfiguration: !Ref CFNCrawlerName
+      Command:   
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${bucketprefix}-${AWS::AccountId}/scripts/produce_training_data"
+             # for access to directories use proper IAM role with permission to buckets and folders that begin with "aws-glue-"					 
+             # script uses temp directory from job definition if required (temp directory not used S3 to S3)
+             # script defines target for output as s3://aws-glue-target/sal    		
+      DefaultArguments: ## We need extra jars files for Mleap serialization
+          "--extra-py-files": !Sub "s3://${bucketprefix}-${AWS::AccountId}/scripts/python.zip"
+          "--extra-jars": !Sub "s3://${bucketprefix}-${AWS::AccountId}/scripts/mleap_spark_assembly.jar"
+          "--encryption-type": "sse-s3"
+      AllocatedCapacity: 5  
+      ExecutionProperty:   
+        MaxConcurrentRuns: 1  
+      Name: !Ref CFNJobTrainDataName
+  SGNotebookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "sagemaker.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - !Ref SageMakerManagedPolicy
+      Policies:
+        -
+          PolicyName: "s3-access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: 
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:GetBucketAcl"
+                  - "s3:DeleteObject"
+                  - "s3:GetBucketLocation"
+                Resource: !Sub ${MyBucket.Arn}/*
+        -
+          PolicyName: "kms-key-access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: 
+                  - "kms:Decrypt"
+                  - "kms:Encrypt"
+                  - "kms:GenerateDataKey"
+                  - "kms:GenerateDataKeyWithoutPlaintext"
+                  - "kms:DescribeKey"
+                Resource: !Sub ${CMSymmetricKey.Arn}
+  CFVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+      InstanceTenancy: default
+  CFSubNet:
+    Type: AWS::EC2::Subnet
+    Properties: 
+      AvailabilityZone: !Select 
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: 10.0.0.0/24 ##check availability of this subnet
+      VpcId: !Ref CFVPC
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+        GroupDescription: Allow http to client host
+        VpcId:
+          Ref: CFVPC
+        SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+  CFInternetGateway:
+    Type: AWS::EC2::InternetGateway
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        Ref: CFVPC
+      InternetGatewayId:
+        Ref: CFInternetGateway
+  CFSageMaker: 
+    Type: AWS::SageMaker::NotebookInstance
+    UpdateReplacePolicy: Delete
+    Properties: 
+      DefaultCodeRepository: !Ref SGDefaultRepo
+      DirectInternetAccess: Enabled ##Change this value
+      InstanceType: !Ref SGInstanceType
+      KmsKeyId: !Sub ${CMSymmetricKey.Arn}
+      NotebookInstanceName: !Ref SGNotebookName
+      RoleArn: !GetAtt SGNotebookRole.Arn
+      SubnetId: !Ref CFSubNet
+      SecurityGroupIds: 
+        - !Ref InstanceSecurityGroup
+      RootAccess: Enabled ##Change this value - required to install additional packages
+      VolumeSizeInGB: 30
+
+Outputs:
+  KMSKeyId:
+    Description: KMS Key Id
+    Value: !Ref CMSymmetricKey
+  S3BucketName:
+    Description: S3 Bucket Name
+    Value: !Ref MyBucket
+  GlueServiceRole:
+    Description: Glue Service Role Name
+    Value: !Ref GlueServiceRole
+  S3UploadUser:
+    Description: IAM User Name to upload S3 Objects
+    Value: !Ref MyUser
+  
