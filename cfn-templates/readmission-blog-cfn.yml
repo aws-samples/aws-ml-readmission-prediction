@@ -1,6 +1,6 @@
 ---
 AWSTemplateFormatVersion: '2010-09-09'
-Description: CloudFormation template to create AWS resources for readmission prediction solution
+Description: CloudFormation template to create AWS resources for readmission prediction solution (uksb-1s7fb4gfp)
 
 Parameters: 
   bucketprefix: 
