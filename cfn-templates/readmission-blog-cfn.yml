@@ -86,6 +86,13 @@ Resources:
           Condition:
             StringNotEquals:
               's3:x-amz-server-side-encryption': 'aws:kms'
+        - Principal: "*"
+          Effect: Deny
+          Action: s3:*
+          Resource: [!Sub '${MyBucket.Arn}/*', !Sub '${MyBucket.Arn}']
+          Condition:
+            Bool:
+              'aws:SecureTransport': 'false'
   MyUser:
     Type: AWS::IAM::User
     Properties:
